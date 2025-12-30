@@ -1,0 +1,6 @@
+ROGER/*
+temp_images/*
+saved_results/*
+wandb/*
+__pycache__/*
+Unrolled_Net/__pycache__/*

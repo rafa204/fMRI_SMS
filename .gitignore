@@ -3,4 +3,7 @@ temp_images/*
 saved_results/*
 wandb/*
 __pycache__/*
-Unrolled_Net/__pycache__/*
+SPSG/grappa_ksp/*
+SPSG/__pycache__/*
+*.pyc
+*.png

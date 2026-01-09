@@ -14,7 +14,6 @@ class Data_consistency(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.conf = Config().parse()
         
 
     def repeat_along_neg_dim(self, x, N, negdim):
@@ -64,3 +63,8 @@ class Data_consistency(torch.nn.Module):
             r_now = torch.clone(r_next)
             
         return b_approx
+
+    def single_slice_EH(self, kspace, coil):
+        image = cus_ifft(kspace, [-2,-1])
+
+        return torch.sum(image * torch.conj(coil), dim=-3)

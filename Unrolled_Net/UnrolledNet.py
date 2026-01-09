@@ -13,6 +13,12 @@ class UnrolledNet(nn.Module):
         self.nb_unroll_blocks = nb_unroll_blocks
         self.mu = torch.nn.Parameter(torch.tensor(mu), requires_grad = True)
         self.test = test
+        self.caipi_shift = [i*42 for i in [3,2,1,0,-1]]
+    
+    def apply_caipi(self, x, dir = 1):
+        for i in range(x.shape[1]): 
+            x = x.roll(dir*self.caipi_shift[i], 2) 
+        return x 
         
     def forward(self, kspace, coil, mask): 
 
@@ -24,6 +30,7 @@ class UnrolledNet(nn.Module):
         
         for i in range(self.nb_unroll_blocks):
             
+            output = self.apply_caipi(output, dir = 1)
             output = output.contiguous().view(-1, Nb*Nx, Ny)          #(N_batches, Nb * Nx, Ny )
             inter_output_DC[i] = output.detach().clone().abs().cpu()
             output = torch.stack((output.real, output.imag), axis=-3) #(N_batches, 2, Nb * Nx, Ny )
@@ -31,7 +38,7 @@ class UnrolledNet(nn.Module):
             output = output[..., 0, :, :] + 1j*output[..., 1, :, :]   #(N_batches, Nb * Nx, Ny)
             inter_output_RES[i] = output.detach().clone().abs().cpu()
             output = output.contiguous().view(-1, Nb, Nx, Ny)         #(N_batches, Nb, Nx, Ny)
-
+            output = self.apply_caipi(output, dir = -1)
             output = self.dc(zerofilled, coil, mask, output, self.mu)
 
         if self.test:

@@ -8,29 +8,14 @@ from Unrolled_Net.data_consistency import Data_consistency
 from Unrolled_Net.UnrolledNet import UnrolledNet
 from configs import Config
 import h5py as h5
+import hdf5storage
 from skimage.metrics import structural_similarity as ssim 
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from PIL import Image
 import wandb
 import io
-import time
-import psutil
+from SPSG.spsg_utils import get_grappa_kernel, fill_grappa_kspace
 
-def get_ram_info():
-    """
-    Retrieves and prints total and available RAM information.
-    """
-    mem = psutil.virtual_memory()
-    # Convert bytes to gigabytes for readability
-    total_ram_gb = mem.total / (1024**3)
-    available_ram_gb = mem.available / (1024**3)
-    used_ram_percent = mem.percent
-
-    print(f"Total RAM: {total_ram_gb:.2f} GB")
-    print(f"Available RAM: {available_ram_gb:.2f} GB")
-    print(f"RAM Used Percentage: {used_ram_percent}%")
-
-# Run the function
 
 def get_perf_metrics(x_ref, x):
     """
@@ -55,20 +40,32 @@ def L1_L2_norm(output, ref):
     return L1 + L2
 
 
-def get_SMS_file_list(category):
+def get_SMS_file_list(category="train", path = None):
 
     train_path = Path("/home/daedalus1-raid1/omer-data/fMRI_FOV3/training_corrected/")
     test_path = Path("/home/daedalus1-raid1/omer-data/fMRI_FOV3/testing_corrected/")
+    grappa_path = Path("/home/range6-raid17/merve-data/fMRI_dat2mat/RawData/")
+    rng = np.random.default_rng(0)
+    subj_random_select = rng.permutation(range(5,9))
+    run_random_select = rng.permutation(range(1,11))
+
     file_list = []
     if category in ["train", "val"]:
-        for sub in range(5,9):
-            for r in range(1,11):
-                file_list.append(train_path / f"Csubject_{sub}_run_{r}.mat")
+        for sub in subj_random_select:
+            for r in run_random_select:
+                path1 = train_path / f"Csubject_{sub}_run_{r}.mat"
+                path2 = grappa_path / f"subject_{sub:02d}_run_{r:02d}.mat"
+                file_list.append((path1, path2))
     elif category == "test":
         for r in range(1,11):
-            for s in range(1,16):
-                for subj in [19,21,9,10,11,13]:
-                    file_list.append(test_path / f"Csubject_{subj}_slice_{s}_run_{r}.mat")
+            for subj in [9,10,11,13]:
+                slice_list = []
+                for s in range(1,16):
+                    path1 = test_path / f"Csubject_{subj}_slice_{s}_run_{r}.mat"
+                    slice_list.append(path1)
+                path2 = grappa_path / f"subject_{subj:02d}_run_{r:02d}.mat"
+                file_list.append((path1, path2))
+
 
     return file_list
 
@@ -138,50 +135,52 @@ def gauss_dist(mask, samp_rat, center):
 
 class kspace_SMS_dataset(Dataset):
 
-    def __init__(self, category, device, acc_rate, ordered = True):
+    def __init__(self, category, device):
         self.conf = Config().parse()
         self.device = device
         self.category = category
-        self.acc_rate = acc_rate
         self.temp_ksp = None
         self.temp_coils = None
         self.n_slice_grps = 16
-        self.ksp_str = f'kspace_all_r{acc_rate}'
-        self.ordered = ordered
         self.gauss_mask = None
         self.cache = {}   # per worker
+        self.ksp_str = f'kspace_all_r2'
+        nx,ny = 110,128
 
         # Determine number of slices
         if category == "train":
             self.num_slices = self.conf.n_train
+            self.ordered = self.conf.ordered
         elif category == "val":
             self.conf.n_masks = 1
             self.num_slices = self.conf.n_val
+            self.ordered = True 
         elif category == "test":
             self.conf.n_masks = 1
             self.n_slice_grps = 1
             self.num_slices = self.conf.n_test
-            self.ksp_str = f'kspace_all_r{acc_rate}_small'
+            self.ksp_str = f'kspace_all_r2_small'
+            self.ordered = True 
 
         self.file_list = get_SMS_file_list(category)
 
-        example_ksp = h5.File(self.file_list[0])[self.ksp_str][0]['real']
-        self.omega_mask = torch.ones(example_ksp.shape, dtype = torch.complex64).to(self.device)
-        self.omega_mask[example_ksp == 0] = 0
+        self.omega_mask_r4 = torch.from_numpy(mask_generator(110,128,4,32)).to(device).to(torch.complex64)
+        self.omega_mask_r2 = torch.from_numpy(mask_generator(110,128,2,32)).to(device).to(torch.complex64)
 
     # ---------------------------------------------------
     # Mask generation helper
     # ---------------------------------------------------
     def _create_disjoint_masks(self, kspace, seed_val = 1):
         
-        Nc, Nx, Ny = self.omega_mask.shape
+        Nc, Nx, Ny = self.omega_mask_r4.shape
 
         #Find kspace maximum
         flat_idx = torch.argmax(kspace[0,:,:].squeeze().abs()) 
         row_idx = flat_idx.item() // Ny
         col_idx = flat_idx.item() % Ny
-        temp_mask = self.omega_mask[0,:,:].detach().clone().cpu()
-        temp_mask[row_idx-5:row_idx+5, col_idx-5:col_idx+5] = 0
+        temp_mask = self.omega_mask_r4[0,:,:].detach().clone().cpu()
+        c = self.conf.center_size
+        temp_mask[row_idx-c:row_idx+c, col_idx-c:col_idx+c] = 0
 
         if self.conf.gauss:
             if self.gauss_mask is None:
@@ -201,20 +200,65 @@ class kspace_SMS_dataset(Dataset):
         #Center of lambda mask is False
         lambda_mask = lambda_mask.unsqueeze(0).repeat(Nc, 1, 1).to(self.device)
 
-        theta_mask = self.omega_mask - lambda_mask
+        theta_mask = self.omega_mask_r4 - lambda_mask
         
         return lambda_mask, theta_mask.to(self.device)
 
     # ---------------------------------------------------
     def __len__(self):
         return self.num_slices * self.conf.n_masks
+    
+    def read_grappa_mat(self, f):
+        kspace_list = []
+        for i in range(2):
+            full_kspace = f[f"R{i}"]
+            full_kspace = full_kspace['real'][:] + 1j* full_kspace["imag"][:]
+            full_kspace = full_kspace.transpose(3,2,1,0)
+            kspace_list.append(torch.from_numpy(full_kspace).to(self.device).to(torch.complex64))
+        return kspace_list
+
+    def get_grappa_data(self, sampled_kspace, sl_grp_idx, grappa_path, save_path):
+        if save_path.exists():
+            data_dict = h5.File(save_path)
+            return self.read_grappa_mat(data_dict)
+        else:
+            f = h5.File(grappa_path)
+            acs = f["acs_for_spsg"][:]
+            acs = acs["real"] + 1j* acs["imag"]
+            ns, nx, ny, cx, cy = 5, 110, 128, 100, 120
+            kx, ky = 7,7
+            ks = [kx, ky]
+            a,b = cx//2, cy//2
+            p_fourier_pad = 18
+            l = 1e-10
+            
+            #Crop ACS measurement to desired size
+            acs = acs[15,:,:,p_fourier_pad:,:]
+            acs = acs[:,:,nx//2-a:nx//2+a,ny//2-b:ny//2+b]
+            mask_r2 = self.omega_mask_r2.cpu().numpy()[0,:,:]
+            mask_r4 = self.omega_mask_r4.cpu().numpy()[0,:,:]
+             
+            kernels_r2 = get_grappa_kernel(acs, mask_r2, ks, lmbd = l)
+            kernels_r4 = get_grappa_kernel(acs, mask_r4, ks, lmbd = l)
+            mask_list = [mask_r2, mask_r4]
+            data_dict = {}
+            kspace_list = []
+            for i, kernel in enumerate([kernels_r2, kernels_r4]):
+                full_kspace = fill_grappa_kspace(sampled_kspace*mask_list[i], kernel, ks, ns)
+                full_kspace = full_kspace/np.max(np.abs(full_kspace))
+                full_kspace = full_kspace.transpose(0,3,1,2)
+                kspace_list.append(torch.from_numpy(full_kspace).to(self.device).to(torch.complex64))
+                data_dict[f"R{i}"] = {"real": full_kspace.real, "imag": full_kspace.imag}
+            hdf5storage.savemat(save_path, data_dict, matlab_compatible=True, store_python_metadata=True)
+            return kspace_list
+
 
     # ---------------------------------------------------
     def __getitem__(self, idx):
 
         if self.category == "val":
             n_train = self.conf.n_train
-            idx += (n_train - (n_train % self.n_slice_grps) + self.n_slice_grps)
+            idx += n_train
 
         sl_idx = idx // self.conf.n_masks #Slice index
         sl_grp_idx = sl_idx % self.n_slice_grps #Slice group index
@@ -226,41 +270,33 @@ class kspace_SMS_dataset(Dataset):
                          (not self.ordered and cache_idx not in self.cache.keys())
 
         if read_condition:
-            f = h5.File(self.file_list[file_idx])
+            file_path = self.file_list[file_idx][0]
+            f = h5.File(file_path)
             self.cache[cache_idx] = {}
             self.cache[cache_idx]['ksp'] = f[self.ksp_str][:self.n_slice_grps][:] 
             self.cache[cache_idx]['coils'] = f['sense_maps_all_small'][:self.n_slice_grps][:]
-        #    if self.category in ["val", "test"]:
-        #        self.cache[cache_idx]['ss_grappa'] = f['not_padded_all_r4']
-                
 
         kspace = self.cache[cache_idx]['ksp'][sl_grp_idx]
         coils =  self.cache[cache_idx]['coils'][sl_grp_idx]
 
         kspace = kspace['real'] + 1j * kspace['imag']
         coils = coils['real'] + 1j * coils['imag']
+        
+        if self.category == "test":
+            #Run grappa recons for comparison
+            grappa_path = Path(f"SPSG/grappa_ksp/{str(file_path)[60:]}")
+            grappa_kspace = self.get_grappa_data(kspace, sl_grp_idx, self.file_list[idx][1], grappa_path)
 
         # Convert to tensor
         kspace = torch.from_numpy(kspace).to(self.device).to(torch.complex64)
         coils  = torch.from_numpy(coils).to(self.device).to(torch.complex64)
-        # Normalize
-        kspace = kspace / kspace.abs().max()
-
-        #if self.category in ["val", "test"]:
-        #    ss_grappa = self.cache[cache_idx]['ss_grappa'][sl_grp_idx]
-        #    ss_grappa = ss_grappa['real'] + 1j * ss_grappa['imag']
-        #    ss_grappa  = torch.from_numpy(ss_grappa).to(self.device).to(torch.complex64)
-        #    ss_grappa = ss_grappa / ss_grappa.abs().max()
+        kspace = kspace / kspace.abs().max() #normalize
 
         if self.category in ['train', 'val']:
             lambda_mask, theta_mask = self._create_disjoint_masks(kspace, idx)
+            return kspace, coils, theta_mask, lambda_mask, idx
         else:
-            lambda_mask, theta_mask = torch.ones_like(self.omega_mask), self.omega_mask
-
-        #if self.category in ["val", "test"]:
-        #    return kspace, coils, theta_mask, lambda_mask, ss_grappa
-
-        return kspace, coils, theta_mask, lambda_mask
+            return kspace, coils, grappa_kspace
 
 
 def validate_model(model, dataloader):
@@ -270,7 +306,7 @@ def validate_model(model, dataloader):
     test_bar = tqdm(dataloader, desc=f"[Validation]")
     i = 0
     with torch.no_grad():
-        for ksp, coils, theta_mask, lambda_mask in test_bar:
+        for ksp, coils, theta_mask, lambda_mask, _ in test_bar:
 
             # Get undersampled measurements
             y_theta  = ksp*theta_mask
@@ -288,39 +324,35 @@ def validate_model(model, dataloader):
 
     return metrics_list
 
-def test_model(model, R4_dataset, R2_dataset, idx_range):
+def test_model(model, dataset, idx_range):
 
     dc = Data_consistency()
     i = 0
 
-    _, coil_example, _, _  = R4_dataset[0]
+    _, coil_example, _, _, _  = dataset[0]
     Nb, Nc, Nx, Ny = coil_example.shape
     metrics = np.zeros((2, Nb, len(idx_range)))
     with torch.no_grad():
-        omega_mask_r4 = R4_dataset.omega_mask.unsqueeze(0)
-        omega_mask_r2 = R2_dataset.omega_mask.unsqueeze(0)
+        omega_mask_r4 = dataset.omega_mask_r4.unsqueeze(0)
+        omega_mask_r2 = dataset.omega_mask_r2.unsqueeze(0)
 
         for idx in idx_range:
 
-            ksp_r4, coils_r4, _, _  = R4_dataset[idx]
-            ksp_r2, coils_r2, _, _  = R2_dataset[idx]
+            ksp, coils, _, _, _  = dataset[idx]
 
-            ksp_r4 = ksp_r4.unsqueeze(0)
-            coils_r4 = coils_r4.unsqueeze(0)
-            ksp_r2 = ksp_r2.unsqueeze(0)
-            coils_r2 = coils_r2.unsqueeze(0)
+            ksp = ksp.unsqueeze(0)
+            coils = coils.unsqueeze(0)
             
             # Forward pass
-            output, _ = model(ksp_r4, coils_r4, omega_mask_r4)
+            output, _ = model(ksp*omega_mask_r4, coils, omega_mask_r4)
 
-            zerofilled_r2 = dc.EH(ksp_r2, coils_r2, omega_mask_r2)
-            ref_recon = dc(zerofilled_r2, coils_r2, omega_mask_r2, CG_iter = 25)
+            zerofilled_r2 = dc.EH(ksp*omega_mask_r2, coils, omega_mask_r2)
+            ref_recon = dc(zerofilled_r2, coils, omega_mask_r2, CG_iter = 25)
 
-            rssq_coils_r2 = torch.sum(torch.square(torch.abs(coils_r2)), dim = -3)
-            rssq_coils_r4 = torch.sum(torch.square(torch.abs(coils_r4)), dim = -3)
+            rssq_coils = torch.sum(torch.square(torch.abs(coils)), dim = -3)
 
-            ref_recon = ref_recon * rssq_coils_r2
-            output = output * rssq_coils_r4
+            ref_recon = ref_recon * rssq_coils
+            output = output * rssq_coils
 
             for j in range(Nb):
                 metrics[:,j,i] = get_perf_metrics(ref_recon[0,j,:,:], output[0,j,:,:])
@@ -330,8 +362,8 @@ def test_model(model, R4_dataset, R2_dataset, idx_range):
 
 def plot_masks(SMS_dataset):
     
-    kspace, coils, theta_mask, lambda_mask = SMS_dataset[0]
-    omega_mask = SMS_dataset.omega_mask
+    kspace, coils, theta_mask, lambda_mask, _ = SMS_dataset[0]
+    omega_mask = SMS_dataset.omega_mask_r4
 
     fig, ax = plt.subplots(1,3,figsize=(10,5))
     ax[0].imshow(lambda_mask[0,:,:].squeeze().cpu().abs(), cmap = "gray")
@@ -359,7 +391,7 @@ def plot_masks(SMS_dataset):
 
 
 
-def plot_examples(model, dataset_r4, dataset_r2, slice_range, save_path = None, epoch = 0):
+def plot_examples(model, dataset, slice_range, save_path = None, epoch = 0):
     
     j = 0
     fs = 17
@@ -367,54 +399,53 @@ def plot_examples(model, dataset_r4, dataset_r2, slice_range, save_path = None, 
     dc = Data_consistency()
     plt.gray()
     model.eval()
+    caipi_shift = np.array([3,2,1,0,-1]) * 42
 
     with torch.no_grad():
-        omega_mask_r4 = dataset_r4.omega_mask.unsqueeze(0)
-        omega_mask_r2 = dataset_r2.omega_mask.unsqueeze(0)
+        omega_mask_r4 = dataset.omega_mask_r4.unsqueeze(0)
+        omega_mask_r2 = dataset.omega_mask_r2.unsqueeze(0)
         for i in slice_range:
-            if i > len(dataset_r2): continue
-            ksp_r4, coils_r4, _, _ = dataset_r4[i]
-            ksp_r2, coils_r2, _, _ = dataset_r2[i]
+            if i > len(dataset): continue
+            ksp, coils, grappa_kspace = dataset[i]
 
-            ksp_r4 = ksp_r4.unsqueeze(0)
-            coils_r4 = coils_r4.unsqueeze(0)
-            ksp_r2 = ksp_r2.unsqueeze(0)
-            coils_r2 = coils_r2.unsqueeze(0)
+            ksp = ksp.unsqueeze(0)
+            coils = coils.unsqueeze(0)
+            grappa_kspace_r2 = grappa_kspace[0].unsqueeze(0)
+            grappa_kspace_r4 = grappa_kspace[1].unsqueeze(0)
 
-            Nbatches, Nb, Nc, Nx, Ny = coils_r2.shape
+            Nbatches, Nb, Nc, Nx, Ny = coils.shape
             
-            rss_coils = torch.sum(torch.square(torch.abs(coils_r2)), dim = -3)
+            rss_coils = torch.sum(torch.square(torch.abs(coils)), dim = -3)
 
-            zerofilled_r4 = dc.EH(ksp_r4, coils_r4, omega_mask_r4)
-            zerofilled_r2 = dc.EH(ksp_r2, coils_r2, omega_mask_r2)
+            grappa_recon_r4 = dc.single_slice_EH(grappa_kspace_r4, coils)
+            grappa_recon_r4 = (grappa_recon_r4 * rss_coils).abs().squeeze()
 
-            cg_recon = dc(zerofilled_r4, coils_r4, omega_mask_r4)
-            cg_recon = cg_recon * rss_coils
-            cg_recon = cg_recon.abs().squeeze()
+            grappa_recon_r2 = dc.single_slice_EH(grappa_kspace_r2, coils)
+            grappa_recon_r2 = (grappa_recon_r2 * rss_coils).abs().squeeze()
+            
 
-            cnn_recon, _ = model(ksp_r4, coils_r4, omega_mask_r4)
+            cnn_recon, _ = model(ksp, coils, omega_mask_r4)
             cnn_recon = cnn_recon * rss_coils
             cnn_recon = cnn_recon.abs().squeeze()
-
-            cg_recon_r2 =  dc(zerofilled_r2, coils_r2, omega_mask_r2, CG_iter = 25)
-            cg_recon_r2 = cg_recon_r2 * rss_coils
-            cg_recon_r2 = cg_recon_r2.abs().squeeze()
             
             fig, ax = plt.subplots(3, Nb, figsize=(16, 7.5))
                 
             for i in range(Nb):
-                psnr_val_cg, ssim_val_cg = get_perf_metrics(cg_recon[i,:,:], cg_recon_r2[i,:,:])
-                psnr_val_cnn, ssim_val_cnn = get_perf_metrics(cnn_recon[i,:,:], cg_recon_r2[i,:,:])
+                psnr_val_grappa, ssim_val_grappa = get_perf_metrics(grappa_recon_r4[i,:,:], grappa_recon_r2[i,:,:])
+                psnr_val_cnn, ssim_val_cnn = get_perf_metrics(cnn_recon[i,:,:], grappa_recon_r2[i,:,:])
+                cnn_recon[i,:,:] = cnn_recon[i,:,:].roll(caipi_shift[i], 0)
+                grappa_recon_r4[i,:,:] = grappa_recon_r4[i,:,:].roll(caipi_shift[i], 0)
+                grappa_recon_r2[i,:,:] = grappa_recon_r2[i,:,:].roll(caipi_shift[i], 0)
 
-                ax[0,i].imshow(cg_recon_r2[i,:,:].cpu())
-                if i==0: ax[0,i].set_ylabel('CG-SENSE R=2', fontsize=fs)
+                ax[0,i].imshow(grappa_recon_r2[i,:,:].cpu())
+                if i==0: ax[0,i].set_ylabel('SPSG R=2', fontsize=fs)
 
-                ax[1,i].imshow(cg_recon[i,:,:].cpu())
+                ax[1,i].imshow(grappa_recon_r4[i,:,:].cpu())
                 ax[1,i].text(0.02, 0.02,
-                f'PSNR: {psnr_val_cg:.3f}\nSSIM: {ssim_val_cg:.3f}',
+                f'PSNR: {psnr_val_grappa:.3f}\nSSIM: {ssim_val_grappa:.3f}',
                 color='white', fontsize=fs-7, fontweight='bold',
                 ha='left', va='bottom', transform=ax[1,i].transAxes)
-                if i==0: ax[1,i].set_ylabel('CG-SENSE R=4', fontsize=fs)
+                if i==0: ax[1,i].set_ylabel('SPSG R=4', fontsize=fs)
 
                 ax[2,i].imshow(cnn_recon[i,:,:].cpu())
                 if i==0: ax[2,i].set_ylabel('PDDL recon R=4', fontsize=fs)
@@ -473,8 +504,21 @@ def plot_metrics(save_path, train_metrics, val_metrics, epoch):
 
 
 def quick_plot(img, path = "test.png"):
-    plt.figure()
-    plt.imshow(img, cmap = "gray")
-    plt.savefig(path)
+    fig, ax = plt.subplots(1,1)
+    ax.imshow(img, cmap = "gray")
+    ax.set_xticklabels([])
+    ax.set_yticklabels([])
+    ax.tick_params(axis='x', length=0)
+    ax.tick_params(axis='y', length=0)
+    ax.axis('off')
+    fig.savefig(path,bbox_inches='tight', pad_inches=0)
     plt.close('all')
 
+def mask_generator(nx,ny,r,coil_dim = 0):
+    mask = np.zeros((r,ny))
+    mask[-1,:] = 1
+    mask = np.tile(mask,(nx//r+1, 1))
+    mask = mask[:nx,:ny]
+    if coil_dim > 0:
+        mask = np.tile(mask[np.newaxis,:,:], (coil_dim,1,1))
+    return mask

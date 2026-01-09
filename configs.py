@@ -9,14 +9,15 @@ class Config:
         # directory for the out directory
         self.parser.add_argument('--out_path', type=str, default='test', help='results file directory')
         self.parser.add_argument('--cuda', type=str, default='0', help='CUDA device to use')
-        self.parser.add_argument('--wandb_group', type=str, default='test_0', help='Name of wandb group')
+        self.parser.add_argument('--wandb_group', type=str, default='01-09', help='Name of wandb group')
         self.parser.add_argument('--wandb', type=int, default=0, help='use weights and biases to record results')
         
         # hyperparameters for the type of training type
-        self.parser.add_argument('--train_type', type=str, default='SSDU-SM', help='kind of training')
-        self.parser.add_argument('--n_masks', type=int, default=3, help='num masks for multi-mask')
+        self.parser.add_argument('--n_masks', type=int, default=1, help='num masks for multi-mask')
         self.parser.add_argument('--gauss', type=int, default=0, help='whether to use gauss. distribution')
         self.parser.add_argument('--lambda_ratio', type=float, default=0.416, help='sampling ratio for lambda mask')
+        self.parser.add_argument('--center_size', type=int, default=3, help='sampling ratio for lambda mask')
+        self.parser.add_argument('--ordered', type=int, default=1, help='sampling ratio for lambda mask')
         
         # Hyperparameters for leaning
         self.parser.add_argument('--n_train', type=int, default=480, help='number of slices in training')
@@ -31,7 +32,7 @@ class Config:
         self.parser.add_argument('--val_freq', type=int, default=1, help='Validation freq')
         self.parser.add_argument('--plot_freq', type=int, default=10, help='Plotting reconstructions freq') 
         self.parser.add_argument('--plot_local', type=int, default=0, help='Plotting reconstructions to file?') 
-        self.parser.add_argument('--n_plot', type=int, default=4, help='slices to plot')
+        self.parser.add_argument('--n_plot', type=int, default=3, help='slices to plot')
 
         # hyperparameters for the unrolled network
         self.parser.add_argument('--nb_unroll_blocks', type=int, default=10, help='number of unrolled blocks')
@@ -50,8 +51,5 @@ class Config:
     def parse(self, args=None):
         """Parse the configuration"""
         self.conf = self.parser.parse_args(args=args)
-
-        if(self.conf.train_type != "SSDU-MM"):
-            self.conf.n_masks = 1
 
         return self.conf
